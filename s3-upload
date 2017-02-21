@@ -1,0 +1,124 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Getopt::Long 'GetOptions';
+use Path::Tiny 'path';
+use Paws;
+use Media::Type::Simple;
+use Time::Piece;
+
+GetOptions(
+  'bucket=s'     => \my $bucket,
+  'delete-stale' => \my $delete_stale,
+  'files=s'      => \my $basepath,
+  'force'        => \my $force,
+  'max-age=i'    => \(my $max_age = 0),
+  'region=s'     => \my $region,
+) or die 'unrecognized arguments';
+
+die 'must provide --bucket --region --files'
+  unless $bucket && $region && $basepath;
+
+die "director $basepath not found" unless -d $basepath;
+
+my $s3             = Paws->service('S3', region => $region);
+my $remote_objects = get_remote_objects($s3);
+my $local_objects  = upload($s3, $remote_objects, $basepath);
+
+delete_stale_objects($s3, $remote_objects, $local_objects) if $delete_stale;
+
+# return a hashref of object keys and modified times
+sub get_remote_objects {
+  my $s3 = shift;
+  my (%remote_objects, $token, $truncated);
+  do {
+    my $response = $s3->ListObjectsV2(
+      Bucket => $bucket,
+      ($token ? (ContinuationToken => $token) : ())
+    );
+
+    for (@{$response->{Contents}}) {
+      $remote_objects{ $_->{Key} } =
+        Time::Piece->strptime($_->{LastModified}, '%Y-%m-%dT%T.000Z')->epoch;
+    }
+
+    if($response->{isTruncated}) {
+      $token =  $response->{NextContinuationToken};
+      $truncated = 1;
+    }
+  } while ($truncated);
+  return \%remote_objects;
+}
+
+# upload local files to S3, returns a hashref of local objects
+sub upload {
+  my ($s3, $remote_objects, $basepath) = @_;
+
+  # setup mime types, add missing
+  open my $mime_types, '<', '/etc/mime.types' or die "Can't find mime.types $!";
+  my $media = Media::Type::Simple->new( $mime_types );
+  $media->add_type('application/font-woff2', 'woff2');
+
+  my %local_objects = ();
+  my $iter = path($basepath)->iterator({ recurse => 1 });
+  while (my $path = $iter->()) {
+    next if $path->is_dir;
+
+    # remove base dir from the object path
+    my $key  = "$path";
+    my $base = "$basepath";
+    $key     =~ s{$base/}{};
+
+    # guess the mime type
+    my @ext  = $path =~ /\.(\w+)$/;
+    my $mime = eval { @ext ? $media->type_from_ext($ext[0]) : undef };
+    print STDERR $@ if $@;
+    print STDERR "failed to get mimetype for $path\n" unless $mime;
+
+    # for html files remove the extension
+    if ($key =~ /\.html$/) {
+      $key =~ s/\.html$//;
+    }
+
+    # skip files whose basename would be encoded
+    # https://github.com/pplu/aws-sdk-perl/issues/111
+    if ($path->basename !~ qr{^[A-Za-z0-9\-._~/]+$}) {
+      print STDERR "skipping, path contains illegal characters: $path\n";
+      next;
+    }
+
+    # unless forced to, only upload when the local file is newer
+    $local_objects{$key} = [stat "$path"]->[9];
+    next unless $force || ($remote_objects->{$key} || 0) < $local_objects{$key};
+
+    $s3->PutObject(
+      Bucket  => $bucket,
+      Key     => $key,
+      ACL     => 'public-read',
+      Body    => $path->slurp_raw,
+      ($max_age ? (CacheControl => "max-age=$max_age") : ()),
+      ($mime ? (ContentType => $mime) : () ),
+    );
+    print "$path\n";
+  }
+  return \%local_objects;
+}
+
+# deletes remote objects which do not exist locally
+sub delete_stale_objects {
+  my ($s3, $remote_objects, $local_objects) = @_;
+  for my $key (keys %{$remote_objects}) {
+    next if exists $local_objects->{$key};
+    print STDERR "delete remote object $key? ";
+    my $answer = <>;
+    chomp $answer;
+
+    if ($answer eq 'y') {
+      print STDERR "Deleting $key\n";
+      $s3->DeleteObject(
+        Bucket  => $bucket,
+        Key     => $key,
+      );
+    }
+  }
+}
