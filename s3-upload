@@ -7,33 +7,37 @@ use Paws;
 use Media::Type::Simple;
 use Time::Piece;
 
+# A script to upload files to S3
+
 GetOptions(
-  'bucket=s'     => \my $bucket,
-  'delete-stale' => \my $delete_stale,
-  'files=s'      => \my $basepath,
-  'force'        => \my $force,
-  'max-age=i'    => \(my $max_age = 0),
-  'region=s'     => \my $region,
+  'bucket=s'     => \my $BUCKET,
+  'delete-stale' => \my $DELETE_STALE,
+  'files=s'      => \my $BASEPATH,
+  'force'        => \my $FORCE,
+  'max-age=i'    => \(my $MAX_AGE = 0),
+  'mime-types=s' => \(my $MIME_TYPES = '/etc/mime.types'),
+  'region=s'     => \my $REGION,
+  'strip=s@'     => \my $STRIP,
 ) or die 'unrecognized arguments';
 
 die 'must provide --bucket --region --files'
-  unless $bucket && $region && $basepath;
+  unless $BUCKET && $REGION && $BASEPATH;
 
-die "director $basepath not found" unless -d $basepath;
+die "directory $BASEPATH not found" unless -d $BASEPATH;
 
-my $s3             = Paws->service('S3', region => $region);
+my $s3             = Paws->service('S3', region => $REGION);
 my $remote_objects = get_remote_objects($s3);
-my $local_objects  = upload($s3, $remote_objects, $basepath);
+my $local_objects  = upload($s3, $remote_objects);
 
-delete_stale_objects($s3, $remote_objects, $local_objects) if $delete_stale;
+delete_stale_objects($s3, $remote_objects, $local_objects) if $DELETE_STALE;
 
 # return a hashref of object keys and modified times
 sub get_remote_objects {
-  my $s3 = shift;
+  my ($s3) = @_;
   my (%remote_objects, $token, $truncated);
   do {
     my $response = $s3->ListObjectsV2(
-      Bucket => $bucket,
+      Bucket => $BUCKET,
       ($token ? (ContinuationToken => $token) : ())
     );
 
@@ -52,21 +56,21 @@ sub get_remote_objects {
 
 # upload local files to S3, returns a hashref of local objects
 sub upload {
-  my ($s3, $remote_objects, $basepath) = @_;
+  my ($s3, $remote_objects) = @_;
 
   # setup mime types, add missing
-  open my $mime_types, '<', '/etc/mime.types' or die "Can't find mime.types $!";
-  my $media = Media::Type::Simple->new( $mime_types );
+  open my $mime_types, '<', $MIME_TYPES or die "Can't find $MIME_TYPES $!";
+  my $media = Media::Type::Simple->new($mime_types);
   $media->add_type('application/font-woff2', 'woff2');
 
   my %local_objects = ();
-  my $iter = path($basepath)->iterator({ recurse => 1 });
+  my $iter = path($BASEPATH)->iterator({ recurse => 1 });
   while (my $path = $iter->()) {
     next if $path->is_dir;
 
     # remove base dir from the object path
     my $key  = "$path";
-    my $base = "$basepath";
+    my $base = "$BASEPATH";
     $key     =~ s{$base/}{};
 
     # guess the mime type
@@ -75,10 +79,8 @@ sub upload {
     print STDERR $@ if $@;
     print STDERR "failed to get mimetype for $path\n" unless $mime;
 
-    # for html files remove the extension
-    if ($key =~ /\.html$/) {
-      $key =~ s/\.html$//;
-    }
+    # strip file extensions
+    $key =~ s/\.$_$// for (@$STRIP);
 
     # skip files whose basename would be encoded
     # https://github.com/pplu/aws-sdk-perl/issues/111
@@ -89,14 +91,14 @@ sub upload {
 
     # unless forced to, only upload when the local file is newer
     $local_objects{$key} = [stat "$path"]->[9];
-    next unless $force || ($remote_objects->{$key} || 0) < $local_objects{$key};
+    next unless $FORCE || ($remote_objects->{$key} || 0) < $local_objects{$key};
 
     $s3->PutObject(
-      Bucket  => $bucket,
+      Bucket  => $BUCKET,
       Key     => $key,
       ACL     => 'public-read',
       Body    => $path->slurp_raw,
-      ($max_age ? (CacheControl => "max-age=$max_age") : ()),
+      ($MAX_AGE ? (CacheControl => "max-age=$MAX_AGE") : ()),
       ($mime ? (ContentType => $mime) : () ),
     );
     print "$path\n";
@@ -116,7 +118,7 @@ sub delete_stale_objects {
     if ($answer eq 'y') {
       print STDERR "Deleting $key\n";
       $s3->DeleteObject(
-        Bucket  => $bucket,
+        Bucket  => $BUCKET,
         Key     => $key,
       );
     }
