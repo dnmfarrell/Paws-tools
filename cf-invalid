@@ -1,0 +1,48 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Paws;
+use Getopt::Long 'GetOptions';
+use Time::HiRes 'gettimeofday';
+
+GetOptions(
+  'distribution-id=s' => \my $DISTRIBUTION_ID,
+  'keys=s'            => \my @KEYS,
+  'region=s'          => \my $REGION,
+) or die 'unrecognized arguments';
+
+# don't block on empty STDIN
+STDIN->blocking(0);
+@KEYS = map { chomp;"/$_" } @KEYS, <STDIN>;
+
+die 'no objects to invalidate!' unless @KEYS;
+
+printf "Invalidating cached keys: %s\n", join ', ', @KEYS;
+
+my $cfront = Paws->service('CloudFront', region => $REGION);
+my $uid    = join '-', gettimeofday();
+exit(0);
+$cfront->CreateInvalidation(
+  DistributionId    => $DISTRIBUTION_ID,
+  InvalidationBatch => {
+      CallerReference => $uid,
+      Paths           => {
+        Quantity => scalar @KEYS,
+        Items    => \@KEYS,
+      }
+  }
+);
+
+=head1 NAME
+
+cf-invalid - invalidate AWS CloudFront caches
+
+=head1 SYNOPSIS
+
+  # invalidate new keys uploaded to S3
+  ./s3-upload --files static --bucket example.com --region us-east-1 | ./cf-invalid --distribution-id E9D4922BD9120 --region us-east-1
+
+  # specify a list of keys to invalidate
+  ./cf-invalid --distribution-id E9D4922BD9120 --region us-east-1 --keys index --keys about
+
+=cut
