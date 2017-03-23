@@ -101,7 +101,7 @@ sub upload {
       ($MAX_AGE ? (CacheControl => "max-age=$MAX_AGE") : ()),
       ($mime ? (ContentType => $mime) : () ),
     );
-    print "$path\n";
+    print "$key\n";
   }
   return \%local_objects;
 }
